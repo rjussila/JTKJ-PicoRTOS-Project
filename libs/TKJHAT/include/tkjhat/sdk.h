@@ -763,7 +763,15 @@ void init_veml6030(void);
  *       (> integration time, i.e. 100 ms).
  */
 uint32_t veml6030_read_light(void);
-
+    i2c_init(i2c_default, 400*1000);
+    gpio_set_function(PICO_DEFAULT_I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(PICO_DEFAULT_I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(PICO_DEFAULT_I2C_SCL_PIN);
+    gpio_pull_up(PICO_DEFAULT_I2C_SDA_PIN);
+    while(1) {
+        if(i2c_write_blocking(i2c_default, HDC2021_I2C_ADDRESS, txBuffer, 1, true) != PICO_ERROR_GENERIC) {
+            if(i2c_read_blocking(i2c_default, HDC2021_I2C_ADDRESS, rxBuffer, 2, false) != PICO_ERROR_GENERIC) {
+            
 /**
  * @brief Power down the VEML6030.
  *
