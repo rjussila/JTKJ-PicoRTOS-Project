@@ -1,4 +1,4 @@
-//#include <stdio.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -20,9 +20,9 @@
 #define EVENT_QUEUE_SIZE   10     // Jonon koko (montako merkkiä mahtuu puskuriin)
 
 // Kiihtyvyysanturin kynnysarvot (riippuu anturin herkkyydestä, oletus n. 16000 = 1G)
-#define ACCEL_THRESHOLD    8000
+#define ACCEL_THRESHOLD    12000 
 // Aika (ms), joka asennon pitää pysyä vakaana ennen lähetystä
-#define STABLE_TIME_MS     500   
+#define STABLE_TIME_MS     2000   
 
 // Pinnit (Tarkista nämä SDK:sta / kytkentäkaaviosta)
 #ifndef RED_LED_PIN
@@ -50,8 +50,8 @@ void read_imu_accel(int16_t *x, int16_t *y, int16_t *z) {
      // Esimerkki: OUTX_L_A (Tarkista datalehdestä!)
     
     // Oletetaan IMU_I2C_ADDR on määritelty SDK:ssa
-    //i2c_write_blocking(i2c_default, IMU_I2C_ADDR, &reg, 1, true);
-    //i2c_read_blocking(i2c_default, IMU_I2C_ADDR, buffer, 6, false);
+    // i2c_write_blocking(i2c_default, IMU_I2C_ADDR, &reg, 1, true);
+    // i2c_read_blocking(i2c_default, IMU_I2C_ADDR, buffer, 6, false);
 
     // Simuloidaan arvoja testausta varten (poista tämä kun I2C toimii):
     //*x = 0; *y = 0; *z = 16000; // Simuloi "litteänä pöydällä"
@@ -80,7 +80,7 @@ static void imu_task(void *arg) {
     TickType_t aloitus = 0;
 
     // Alusta IMU tässä (i2c komennot)
-    init_i2c(12, 13); 
+    // init_imu(); 
 
     while (1) {
         read_imu_accel(&ax, &ay, &az);
@@ -93,7 +93,7 @@ static void imu_task(void *arg) {
         switch (myState) {
             case STATE_IDLE:
             case STATE_lahetetty:
-                if (littea) {
+                if (pysty) {
                     myState = STATE_tarkasta_viiva;
                     aloitus = xTaskGetTickCount(); // Aloita ajanotto
                 } else if (pysty) {
@@ -148,14 +148,8 @@ static void comm_task(void *arg) {
         // xQueueReceive odottaa 10ms (ei blokkaa kokonaan, jotta vastaanotto toimii)
         if (xQueueReceive(xMorseQueue, &char_merkki, pdMS_TO_TICKS(10))) {
             
-            // 1. Luo puskuri (riittävän iso, esim. 32 merkkiä)
-            char buf[32];
-
-// 2. Muotoile teksti puskuriin sprintf-funktiolla
-            sprintf(buf, "Sending: '[%c]' (ASCII: %d)\n", char_merkki);
-
-// 3. Tulosta valmis puskuri
-            usb_serial_print(buf);
+            // 1. Tulosta debug-kanavaan
+            usb_serial_print("Sending: %c\n", char_merkki);
             
             // 2. Lähetä data-kanavaan (CDC 1)
             if (tud_cdc_n_connected(1)) {
@@ -197,7 +191,7 @@ static void usb_task(void *arg) {
 // --- PÄÄOHJELMA ---
 int main() {
     // Alustukset
-    usb_serial_init();
+    usb_serial_debug_init();
     tud_init(BOARD_TUD_RHPORT);
     init_hat_sdk();
     
@@ -206,7 +200,7 @@ int main() {
     gpio_init(SW1_PIN); gpio_set_dir(SW1_PIN, GPIO_IN); gpio_pull_down(SW1_PIN); // Tai pull_up riippuen kytkennästä
 
     // Keskeytys napille
-    gpio_set_irq_enabled_with_callback(SW1_PIN, GPIO_IRQ_EDGE_RISE, true, &btn_fxn);
+    gpio_set_irq_enabled_with_callback(SW1_PIN, GPIO_IRQ_EDGE_RISE, true, &btn_isr_handler);
 
     // 1. Luo JONO (Queue)
     xMorseQueue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(char));
