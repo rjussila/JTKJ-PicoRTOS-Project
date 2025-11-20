@@ -1,0 +1,294 @@
+Tämä on loistava päivitys! Nyt sinulla on oikea ajuri, joka hoitaa raakadatan muuntamisen ymmärrettävään muotoon (g-voimiksi).
+
+Tämä tarkoittaa kahta isoa muutosta main.c-koodiin:
+
+Tietotyyppi muuttuu: Emme käytä enää int16_t (kokonaislukuja), vaan float (desimaalilukuja).
+
+Kynnysarvo muuttuu: Koska data on g-voimia, 1G on 1.0 eikä 16384. Kynnysarvoksi sopii esimerkiksi 0.8 (g).
+
+Tässä on päivitetty src/main.c, joka hyödyntää juuri antamiasi SDK-funktioita (init_ICM42670, start_with_default_values ja read_sensor_data).
+
+🛠️ Päivitetty src/main.c
+Kopioi tämä kokonaan tiedostosi päälle.
+
+C
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h> // Tarvitaan fabsf() funktiolle
+
+#include <pico/stdlib.h>
+#include <hardware/i2c.h>
+#include <hardware/gpio.h>
+
+#include <FreeRTOS.h>
+#include <queue.h>
+#include <task.h>
+
+#include "tkjhat/sdk.h"
+#include "tusb.h"
+#include "usb_serial_debug.h" 
+
+// --- VAKIOT JA ASETUKSET ---
+#define DEFAULT_STACK_SIZE 2048
+#define EVENT_QUEUE_SIZE   10
+
+// Kiihtyvyysanturin kynnysarvo (G-voimina)
+// Koska uusi SDK palauttaa float-arvoja (1.0 = 1G), käytetään kynnystä 0.7G.
+// Tämä tarkoittaa: jos akselin arvo on yli 0.7 tai alle -0.7, se on dominoiva.
+#define ACCEL_THRESHOLD_G  0.7f 
+
+#define STABLE_TIME_MS     500   
+
+// Pinnit
+#ifndef RED_LED_PIN
+#define RED_LED_PIN 20
+#endif
+#ifndef SW1_PIN
+#define SW1_PIN 2
+#endif
+
+// --- GLOBAALIT MUUTTUJAT ---
+QueueHandle_t xMorseQueue; 
+
+typedef enum {
+    STATE_IDLE,
+    STATE_CHECK_DASH, // Vaaka -> Viiva
+    STATE_CHECK_DOT,  // Pysty -> Piste
+    STATE_SENT
+} SystemState_t;
+
+// --- TEHTÄVÄ: KESKEYTYSKÄSITTELIJÄ (NAPPI) ---
+static void btn_fxn(uint gpio, uint32_t eventMask){
+    if (gpio == SW1_PIN) {
+        // Yksinkertaistettu: napin painallus lähettää välilyönnin
+        // Voit lisätä tähän aiemman "pitkä painallus" -logiikan jos haluat
+        char merkki = ' '; 
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(xMorseQueue, &merkki, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+// --- TEHTÄVÄ: IMU / ASENNON TUNNISTUS ---
+static void imu_task(void *arg) {
+    (void)arg;
+    
+    // MUUTOS: Käytetään float-tyyppejä, koska SDK palauttaa G-voimia
+    float ax, ay, az, gx, gy, gz, temp;
+    
+    SystemState_t myState = STATE_IDLE;
+    TickType_t aloitus = 0;
+
+    // 1. Alusta anturi käyttäen UUSIA SDK-funktioita
+    int rc = init_ICM42670();
+    if (rc != 0) {
+        usb_serial_print("IMU Init failed: %d\n", rc);
+    }
+    
+    rc = ICM42670_start_with_default_values(); // Asettaa ODR, FSR ja Low-Noise tilan
+    if (rc != 0) {
+        usb_serial_print("IMU Config failed: %d\n", rc);
+    }
+
+    while (1) {
+        // 2. Lue data käyttäen UUTTA funktiota
+        // Tämä täyttää float-muuttujat arvoilla (yksikkö: g)
+        ICM42670_read_sensor_data(&ax, &ay, &az, &gx, &gy, &gz, &temp);
+
+        // Debug-tulostus (poista kommentit jos haluat nähdä arvot)
+        /*
+        char dbg[64];
+        sprintf(dbg, "X: %.2f Y: %.2f Z: %.2f\n", ax, ay, az);
+        usb_serial_print(dbg);
+        */
+
+        // 3. Tunnista asento
+        // Käytä fabsf() itseisarvolle (koska g voi olla negatiivinen, esim -1.0)
+        
+        // Laite pöydällä: Z-akseli on n. 1.0 (tai -1.0) -> VIIVA
+        bool littea = (fabsf(az) > ACCEL_THRESHOLD_G); 
+        
+        // Laite pystyssä: X-akseli on n. 1.0 (tai -1.0) -> PISTE
+        bool pysty  = (fabsf(ax) > ACCEL_THRESHOLD_G); 
+        
+        switch (myState) {
+            case STATE_IDLE:
+            case STATE_SENT:
+                if (littea) {
+                    myState = STATE_CHECK_DASH;
+                    aloitus = xTaskGetTickCount();
+                } else if (pysty) {
+                    myState = STATE_CHECK_DOT;
+                    aloitus = xTaskGetTickCount();
+                } else {
+                    myState = STATE_IDLE;
+                }
+                break;
+
+            case STATE_CHECK_DASH: // Odotetaan viivaa (-)
+                if (!littea) myState = STATE_IDLE;
+                else if ((xTaskGetTickCount() - aloitus) * portTICK_PERIOD_MS >= STABLE_TIME_MS) {
+                    char c = '-';
+                    xQueueSend(xMorseQueue, &c, 0);
+                    myState = STATE_SENT;
+                }
+                break;
+
+            case STATE_CHECK_DOT: // Odotetaan pistettä (.)
+                if (!pysty) myState = STATE_IDLE;
+                else if ((xTaskGetTickCount() - aloitus) * portTICK_PERIOD_MS >= STABLE_TIME_MS) {
+                    char c = '.';
+                    xQueueSend(xMorseQueue, &c, 0);
+                    myState = STATE_SENT;
+                }
+                break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100)); // 10Hz näytteenotto
+    }
+}
+
+// --- TEHTÄVÄ: KOMMUNIKAATIO ---
+static void comm_task(void *arg) {
+    (void)arg;
+    char received_char;
+    char char_merkki;
+    char buf[64]; 
+
+    while (1) {
+        // LÄHETYS
+        if (xQueueReceive(xMorseQueue, &char_merkki, pdMS_TO_TICKS(10))) {
+            
+            // Tulostetaan debug-viesti
+            sprintf(buf, "Sending: '[%c]'\n", char_merkki);
+            usb_serial_print(buf);
+            
+            if (tud_cdc_n_connected(1)) {
+                tud_cdc_n_write_char(1, char_merkki);
+                tud_cdc_n_write_flush(1);
+            }
+        }
+
+        // VASTAANOTTO
+        if (tud_cdc_n_available(1)) {
+            received_char = tud_cdc_n_read_char(1);
+            if (received_char == '.') {
+                gpio_put(RED_LED_PIN, 1); vTaskDelay(pdMS_TO_TICKS(200)); gpio_put(RED_LED_PIN, 0);
+            } else if (received_char == '-') {
+                gpio_put(RED_LED_PIN, 1); vTaskDelay(pdMS_TO_TICKS(600)); gpio_put(RED_LED_PIN, 0);
+            }
+        }
+    }
+}
+
+// --- TEHTÄVÄ: USB DRIVER ---
+static void usb_task(void *arg) {
+    (void)arg;
+    while (1) {
+        tud_task();
+    }
+}
+
+// --- PÄÄOHJELMA ---
+int main() {
+    usb_serial_debug_init(); 
+    tud_init(BOARD_TUD_RHPORT);
+    init_hat_sdk();
+    
+    gpio_init(RED_LED_PIN); gpio_set_dir(RED_LED_PIN, GPIO_OUT);
+    
+    // Varmista napin pull-up/down SDK:n mukaan (Active High = Pull Down)
+    gpio_init(SW1_PIN); gpio_set_dir(SW1_PIN, GPIO_IN); gpio_pull_down(SW1_PIN); 
+
+    gpio_set_irq_enabled_with_callback(SW1_PIN, GPIO_IRQ_EDGE_RISE, true, &btn_fxn);
+
+    xMorseQueue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(char));
+
+    xTaskCreate(usb_task, "USB", 2048, NULL, 3, NULL);
+    xTaskCreate(imu_task, "IMU", 2048, NULL, 2, NULL);
+    xTaskCreate(comm_task, "COMM", 2048, NULL, 2, NULL);
+
+    vTaskStartScheduler();
+    return 0;
+}
+Tärkeimmät muutokset
+Kutsut SDK:hon:
+
+init_imu() (oma funktio) poistettiin. Sen tilalle tuli init_ICM42670() ja ICM42670_start_with_default_values().
+
+Datan luku:
+
+read_imu_accel() poistettiin. Tilalle tuli ICM42670_read_sensor_data(...).
+
+Huomaa, että funktio ottaa parametreina osoittimia floateihin (&ax, &ay...), ei int16:een.
+
+Logiikka:
+
+Kynnysarvo on nyt 0.7f. Koska anturi palauttaa arvon g-yksiköissä, 1.0 tarkoittaa maan vetovoimaa.
+
+Käytämme fabsf() (float absolute value), jotta -1.0g (ylösalaisin) tunnistetaan samoin kuin 1.0g.
+
+Tämä koodi on nyt täysin yhteensopiva antamasi SDK-koodin kanssa!
+
+
+
+
+!!JOS halutaan että led syttyy samalla kun viesti lähetetään eli nappia painetaa!!
+
+Tämä johtuu siitä, että korvasimme Tehtävä 1:n "LEDin vaihto (toggle)" -logiikan uudella logiikalla, jossa napin painallus vain lähettää viestin jonoon.
+
+Nykyisessä koodissa LEDiä ohjataan vain comm_task-tehtävän vastaanotto-osiossa (eli silloin kun tietokone lähettää Picolle dataa).
+
+Kuinka saat LEDin välähtämään lähetyksen yhteydessä?
+Jos haluat visuaalisen palautteen siitä, että nappi (tai asento) on lähettänyt merkin, sinun kannattaa lisätä LEDin vilkutus comm_task-tehtävän lähetys-osioon.
+
+Muokkaa comm_task-funktiota src/main.c -tiedostossa näin:
+
+C
+
+static void comm_task(void *arg) {
+    (void)arg;
+    char received_char;
+    char char_merkki;
+    char buf[64]; 
+
+    while (1) {
+        // --- LÄHETYS (Pico -> PC) ---
+        if (xQueueReceive(xMorseQueue, &char_merkki, pdMS_TO_TICKS(10))) {
+            
+            // Tulostetaan debug-viesti
+            sprintf(buf, "Sending: '[%c]'\n", char_merkki);
+            usb_serial_print(buf);
+            
+            // --- LISÄYS ALKAA: Väläytä LEDiä kun lähetetään ---
+            gpio_put(RED_LED_PIN, 1);       // LED päälle
+            
+            if (tud_cdc_n_connected(1)) {
+                tud_cdc_n_write_char(1, char_merkki);
+                tud_cdc_n_write_flush(1);
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(100)); // Pieni viive jotta silmä erottaa valon
+            gpio_put(RED_LED_PIN, 0);       // LED pois
+            // --- LISÄYS PÄÄTTYY ---
+        }
+
+        // --- VASTAANOTTO (PC -> Pico) ---
+        // ... (tämä pysyy ennallaan) ...
+    }
+}
+Mitä tämä muutos tekee?
+Nyt aina kun jokin tehtävä (nappi tai IMU) lähettää merkin jonoon:
+
+comm_task ottaa merkin jonosta.
+
+Se sytyttää LEDin.
+
+Lähettää datan USB:hen.
+
+Pitää LEDiä päällä 100ms (lyhyt välähdys).
+
+Sammuttaa LEDin.
+
+Näin näet selvästi valosta, milloin välilyönti (napista) tai piste/viiva (asennosta) on lähetetty onnistuneesti.
